@@ -17,8 +17,10 @@ import warnings
 from datetime import datetime
 from textwrap import dedent
 
-import matplotlib
-matplotlib.use("Agg")
+import sys, os
+sys.path.insert(0, os.path.dirname(__file__))
+import plot_config  # Chinese font support — must be before plt/sns
+
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import seaborn as sns
@@ -29,8 +31,6 @@ from scipy.cluster.hierarchy import linkage, dendrogram
 from scipy.spatial.distance import squareform
 
 warnings.filterwarnings("ignore")
-sns.set_theme(style="whitegrid", font_scale=1.1)
-plt.rcParams.update({"figure.max_open_warning": 0})
 
 # ---------------------------------------------------------------------------
 # Paths

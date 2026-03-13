@@ -14,8 +14,10 @@ import os, sys, warnings, json
 from datetime import datetime
 from textwrap import dedent
 
-import matplotlib
-matplotlib.use("Agg")
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
+import plot_config  # Chinese font support — must be before plt/sns
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
@@ -27,7 +29,6 @@ from sklearn.feature_selection import mutual_info_classif
 from imblearn.over_sampling import SMOTE
 
 warnings.filterwarnings("ignore")
-sns.set_theme(style="whitegrid", font_scale=1.05)
 
 # ---------------------------------------------------------------------------
 # Paths

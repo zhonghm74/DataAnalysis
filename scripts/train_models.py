@@ -10,8 +10,10 @@ Approach:
 
 import os, time, warnings, pickle, json
 from datetime import datetime
-import matplotlib
-matplotlib.use("Agg")
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
+import plot_config  # Chinese font support — must be before plt/sns
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
@@ -29,7 +31,6 @@ import lightgbm as lgb
 import xgboost as xgb
 
 warnings.filterwarnings("ignore")
-sns.set_theme(style="whitegrid", font_scale=1.05)
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 DATA_DIR = os.path.join(ROOT, "data", "processed")
