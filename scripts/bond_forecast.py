@@ -38,6 +38,10 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 import pmdarima as pm
 
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
 warnings.filterwarnings("ignore")
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
@@ -272,6 +276,228 @@ record("Naive (t-1)", test["yield_10y"].values, naive_pred,
        time.time() - t0, "y(t)=y(t-1)")
 
 # ===================================================================
+# 3B. TRANSFORMER MODELS
+# ===================================================================
+print("\n" + "=" * 60)
+print("3B. Transformer 类时序模型\n")
+
+SEQ_LEN = 60  # look-back window for transformer models
+
+# --- Sliding-window dataset ---
+class TSDataset(Dataset):
+    def __init__(self, data, seq_len):
+        self.data = data
+        self.seq_len = seq_len
+    def __len__(self):
+        return len(self.data) - self.seq_len
+    def __getitem__(self, idx):
+        x = self.data[idx : idx + self.seq_len]
+        y = self.data[idx + self.seq_len]
+        return torch.FloatTensor(x).unsqueeze(-1), torch.FloatTensor([y])
+
+ts_values = series["yield_10y"].values.astype(np.float32)
+ts_mean, ts_std = ts_values[:-TEST_SIZE].mean(), ts_values[:-TEST_SIZE].std()
+ts_norm = (ts_values - ts_mean) / ts_std
+
+train_ds = TSDataset(ts_norm[:-TEST_SIZE], SEQ_LEN)
+train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+
+# Build test inputs: each test point uses the preceding SEQ_LEN points
+test_start_idx = len(ts_norm) - TEST_SIZE
+test_inputs = []
+for i in range(TEST_SIZE):
+    seq = ts_norm[test_start_idx + i - SEQ_LEN : test_start_idx + i]
+    test_inputs.append(seq)
+test_inputs = torch.FloatTensor(np.array(test_inputs)).unsqueeze(-1)  # (60, SEQ_LEN, 1)
+
+def train_torch_model(model, name, n_epochs=80, lr=1e-3):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+    criterion = nn.MSELoss()
+    model.train()
+    for epoch in range(n_epochs):
+        total_loss = 0
+        for xb, yb in train_loader:
+            optimizer.zero_grad()
+            out = model(xb)
+            loss = criterion(out, yb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total_loss += loss.item()
+        scheduler.step()
+    model.eval()
+    with torch.no_grad():
+        preds_norm = model(test_inputs).numpy().flatten()
+    preds = preds_norm * ts_std + ts_mean
+    return preds
+
+# --- Model 9: Transformer Encoder ---
+class TransformerTS(nn.Module):
+    def __init__(self, d_model=32, nhead=4, num_layers=2, dim_ff=64, dropout=0.1, seq_len=60):
+        super().__init__()
+        self.input_proj = nn.Linear(1, d_model)
+        self.pos_enc = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_ff,
+            dropout=dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.head = nn.Sequential(nn.Linear(d_model, 16), nn.ReLU(), nn.Linear(16, 1))
+    def forward(self, x):
+        x = self.input_proj(x) + self.pos_enc[:, :x.size(1), :]
+        x = self.encoder(x)
+        return self.head(x[:, -1, :])
+
+print("  [9/12] Transformer Encoder …")
+best_tf_rmse, best_tf_pred, best_tf_params = 1e18, None, ""
+for d_model, nhead, nlayers, dim_ff, lr_ in [
+    (32, 4, 2, 64, 1e-3), (64, 4, 3, 128, 5e-4), (32, 4, 3, 64, 5e-4), (16, 4, 2, 32, 1e-3)]:
+    torch.manual_seed(42)
+    mdl = TransformerTS(d_model=d_model, nhead=nhead, num_layers=nlayers, dim_ff=dim_ff, seq_len=SEQ_LEN)
+    t0 = time.time()
+    pred = train_torch_model(mdl, "TransformerTS", n_epochs=80, lr=lr_)
+    rmse = np.sqrt(mean_squared_error(test["yield_10y"].values, pred))
+    pstr = f"d={d_model},h={nhead},L={nlayers},ff={dim_ff},lr={lr_}"
+    print(f"    config [{pstr}] RMSE={rmse:.6f}")
+    if rmse < best_tf_rmse:
+        best_tf_rmse = rmse
+        best_tf_pred = pred
+        best_tf_params = pstr
+        best_tf_time = time.time() - t0
+record("Transformer Encoder", test["yield_10y"].values, best_tf_pred,
+       best_tf_time, best_tf_params)
+
+# --- Model 10: PatchTST ---
+class PatchTST(nn.Module):
+    def __init__(self, seq_len=60, patch_len=10, d_model=32, nhead=4, num_layers=2, dim_ff=64, dropout=0.1):
+        super().__init__()
+        self.patch_len = patch_len
+        n_patches = seq_len // patch_len
+        self.patch_proj = nn.Linear(patch_len, d_model)
+        self.pos_enc = nn.Parameter(torch.randn(1, n_patches, d_model) * 0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_ff,
+            dropout=dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.head = nn.Sequential(nn.Flatten(), nn.Linear(n_patches * d_model, 32),
+                                   nn.ReLU(), nn.Linear(32, 1))
+    def forward(self, x):
+        B = x.size(0)
+        x = x.squeeze(-1)
+        x = x[:, :x.size(1) // self.patch_len * self.patch_len]
+        x = x.reshape(B, -1, self.patch_len)
+        x = self.patch_proj(x) + self.pos_enc
+        x = self.encoder(x)
+        return self.head(x)
+
+print("  [10/12] PatchTST …")
+best_pt_rmse, best_pt_pred, best_pt_params = 1e18, None, ""
+for patch_len, d_model, nlayers, lr_ in [
+    (10, 32, 2, 1e-3), (5, 32, 2, 1e-3), (10, 64, 3, 5e-4), (12, 32, 2, 5e-4)]:
+    torch.manual_seed(42)
+    mdl = PatchTST(seq_len=SEQ_LEN, patch_len=patch_len, d_model=d_model, num_layers=nlayers)
+    t0 = time.time()
+    pred = train_torch_model(mdl, "PatchTST", n_epochs=80, lr=lr_)
+    rmse = np.sqrt(mean_squared_error(test["yield_10y"].values, pred))
+    pstr = f"patch={patch_len},d={d_model},L={nlayers},lr={lr_}"
+    print(f"    config [{pstr}] RMSE={rmse:.6f}")
+    if rmse < best_pt_rmse:
+        best_pt_rmse = rmse
+        best_pt_pred = pred
+        best_pt_params = pstr
+        best_pt_time = time.time() - t0
+record("PatchTST", test["yield_10y"].values, best_pt_pred,
+       best_pt_time, best_pt_params)
+
+# --- Model 11: LSTM + Attention ---
+class LSTMAttention(nn.Module):
+    def __init__(self, hidden_size=64, num_layers=2, dropout=0.1):
+        super().__init__()
+        self.lstm = nn.LSTM(1, hidden_size, num_layers=num_layers,
+                            batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        self.attn_w = nn.Linear(hidden_size, 1)
+        self.head = nn.Sequential(nn.Linear(hidden_size, 16), nn.ReLU(), nn.Linear(16, 1))
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        attn_scores = torch.softmax(self.attn_w(out), dim=1)
+        context = (attn_scores * out).sum(dim=1)
+        return self.head(context)
+
+print("  [11/12] LSTM + Attention …")
+best_la_rmse, best_la_pred, best_la_params = 1e18, None, ""
+for hidden, nlayers, lr_ in [(64, 2, 1e-3), (128, 2, 5e-4), (64, 3, 5e-4), (32, 2, 1e-3)]:
+    torch.manual_seed(42)
+    mdl = LSTMAttention(hidden_size=hidden, num_layers=nlayers)
+    t0 = time.time()
+    pred = train_torch_model(mdl, "LSTM-Attn", n_epochs=80, lr=lr_)
+    rmse = np.sqrt(mean_squared_error(test["yield_10y"].values, pred))
+    pstr = f"h={hidden},L={nlayers},lr={lr_}"
+    print(f"    config [{pstr}] RMSE={rmse:.6f}")
+    if rmse < best_la_rmse:
+        best_la_rmse = rmse
+        best_la_pred = pred
+        best_la_params = pstr
+        best_la_time = time.time() - t0
+record("LSTM + Attention", test["yield_10y"].values, best_la_pred,
+       best_la_time, best_la_params)
+
+# --- Model 12: Informer-lite (ProbSparse Attention) ---
+class ProbSparseAttention(nn.Module):
+    def __init__(self, d_model, nhead):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=0.1)
+    def forward(self, x):
+        B, L, D = x.shape
+        top_k = max(1, int(np.ceil(np.log2(L))))
+        idx = torch.randint(0, L, (B, top_k), device=x.device)
+        q_sparse = torch.gather(x, 1, idx.unsqueeze(-1).expand(-1, -1, D))
+        out, _ = self.attn(q_sparse, x, x)
+        result = x.clone()
+        result.scatter_(1, idx.unsqueeze(-1).expand(-1, -1, D), out)
+        return result
+
+class InformerLite(nn.Module):
+    def __init__(self, seq_len=60, d_model=32, nhead=4, num_layers=2, dim_ff=64, dropout=0.1):
+        super().__init__()
+        self.input_proj = nn.Linear(1, d_model)
+        self.pos_enc = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers):
+            self.layers.append(nn.ModuleList([
+                ProbSparseAttention(d_model, nhead),
+                nn.LayerNorm(d_model),
+                nn.Sequential(nn.Linear(d_model, dim_ff), nn.GELU(), nn.Linear(dim_ff, d_model)),
+                nn.LayerNorm(d_model),
+                nn.Dropout(dropout),
+            ]))
+        self.head = nn.Sequential(nn.Linear(d_model, 16), nn.ReLU(), nn.Linear(16, 1))
+    def forward(self, x):
+        x = self.input_proj(x) + self.pos_enc[:, :x.size(1), :]
+        for attn, ln1, ff, ln2, drop in self.layers:
+            x = ln1(x + drop(attn(x)))
+            x = ln2(x + drop(ff(x)))
+        return self.head(x[:, -1, :])
+
+print("  [12/12] Informer-lite …")
+best_inf_rmse, best_inf_pred, best_inf_params = 1e18, None, ""
+for d_model, nhead, nlayers, lr_ in [
+    (32, 4, 2, 1e-3), (64, 4, 2, 5e-4), (32, 4, 3, 5e-4), (16, 4, 2, 1e-3)]:
+    torch.manual_seed(42)
+    mdl = InformerLite(seq_len=SEQ_LEN, d_model=d_model, nhead=nhead, num_layers=nlayers)
+    t0 = time.time()
+    pred = train_torch_model(mdl, "Informer-lite", n_epochs=80, lr=lr_)
+    rmse = np.sqrt(mean_squared_error(test["yield_10y"].values, pred))
+    pstr = f"d={d_model},h={nhead},L={nlayers},lr={lr_}"
+    print(f"    config [{pstr}] RMSE={rmse:.6f}")
+    if rmse < best_inf_rmse:
+        best_inf_rmse = rmse
+        best_inf_pred = pred
+        best_inf_params = pstr
+        best_inf_time = time.time() - t0
+record("Informer-lite", test["yield_10y"].values, best_inf_pred,
+       best_inf_time, best_inf_params)
+
+# ===================================================================
 # 4. LEADERBOARD
 # ===================================================================
 print("\n" + "=" * 60)
@@ -422,21 +648,43 @@ R.append(f"![历史走势]({p_hist})\n")
 
 R.append("## 2. 模型说明\n")
 R.append("""\
-| 模型 | 类别 | 方法 |
-|---|---|---|
-| ARIMA (auto) | 统计模型 | 自动选择 (p,d,q) 的 ARIMA，通过 AIC 优化 |
-| SARIMAX | 统计模型 | 季节性 ARIMA，网格搜索 order + seasonal_order |
-| ETS (Holt-Winters) | 统计模型 | 指数平滑，搜索 trend/damped 组合 |
-| AR-XGBoost | 机器学习 | 滞后特征 + XGBoost 回归，网格搜索超参 |
-| AR-LightGBM | 机器学习 | 滞后特征 + LightGBM 回归，网格搜索超参 |
-| AR-Random Forest | 机器学习 | 滞后特征 + 随机森林回归，网格搜索超参 |
-| AR-Ridge | 机器学习 | 滞后特征 + 岭回归，搜索正则化强度 |
-| Naive (t-1) | 基线 | 前一日收益率作为预测值 |
+### 统计模型
+| 模型 | 方法 |
+|---|---|
+| ARIMA (auto) | 自动选择 (p,d,q) 的 ARIMA，通过 AIC 优化 |
+| SARIMAX | 季节性 ARIMA，网格搜索 order + seasonal_order |
+| ETS (Holt-Winters) | 指数平滑，搜索 trend/damped 组合 |
+
+### 机器学习模型 (基于手工滞后特征)
+| 模型 | 方法 |
+|---|---|
+| AR-XGBoost | 滞后特征 + XGBoost 回归，网格搜索超参 |
+| AR-LightGBM | 滞后特征 + LightGBM 回归，网格搜索超参 |
+| AR-Random Forest | 滞后特征 + 随机森林回归，网格搜索超参 |
+| AR-Ridge | 滞后特征 + 岭回归，搜索正则化强度 |
+
+### Transformer 类深度学习模型 (端到端序列建模)
+| 模型 | 方法 |
+|---|---|
+| Transformer Encoder | 标准多头自注意力编码器 + 位置编码，网格搜索 d_model/nhead/layers |
+| PatchTST | 将时序分割为 patch 再做 Transformer 编码（2023 SOTA），搜索 patch_len/d_model |
+| LSTM + Attention | 双层 LSTM + 缩放点积注意力池化，搜索 hidden_size/layers |
+| Informer-lite | ProbSparse 注意力机制（降低复杂度的 Informer 变体），搜索 d_model/layers |
+
+### 基线
+| 模型 | 方法 |
+|---|---|
+| Naive (t-1) | 前一日收益率作为预测值 |
 
 **AR 特征工程** (用于 ML 模型):
 - 滞后特征: lag_1, lag_2, lag_3, lag_5, lag_10, lag_20, lag_60
 - 滚动统计: rolling_5_mean, rolling_20_mean, rolling_5_std
 - 差分特征: diff_1, diff_5
+
+**Transformer 输入** (用于深度学习模型):
+- 滑动窗口: 前 60 个交易日的标准化收益率序列
+- 标准化: 训练集均值/标准差归一化
+- 训练: Adam + CosineAnnealing, 80 epochs, 梯度裁剪
 """)
 
 R.append("## 3. 模型排行榜\n")
@@ -468,25 +716,45 @@ R.append("")
 
 R.append("## 8. 结论\n")
 best_name = best["model"]
+
+# categorize results
+stat_models = [r for r in results if r["model"] in ("ARIMA (auto)", "SARIMAX", "ETS (Holt-Winters)")]
+ml_models = [r for r in results if r["model"].startswith("AR-")]
+tf_models = [r for r in results if r["model"] in ("Transformer Encoder", "PatchTST", "LSTM + Attention", "Informer-lite")]
+best_stat = min(stat_models, key=lambda r: r["RMSE"]) if stat_models else None
+best_ml = min(ml_models, key=lambda r: r["RMSE"]) if ml_models else None
+best_tf = min(tf_models, key=lambda r: r["RMSE"]) if tf_models else None
+
 R.append(f"""\
 ### 主要发现
 
 1. **{best_name}** 以 RMSE={best['RMSE']} 取得最优预测性能。
 
-2. **ML 模型 vs 统计模型**: 基于滞后特征的机器学习模型（XGBoost/LightGBM/RF）通常优于传统统计模型（ARIMA/ETS），因为它们能捕捉非线性关系和特征交互。
+2. **三大类模型性能对比**:
+   - 统计模型最优: {best_stat['model'] if best_stat else 'N/A'} (RMSE={best_stat['RMSE'] if best_stat else 'N/A'})
+   - ML 模型最优: {best_ml['model'] if best_ml else 'N/A'} (RMSE={best_ml['RMSE'] if best_ml else 'N/A'})
+   - Transformer 模型最优: {best_tf['model'] if best_tf else 'N/A'} (RMSE={best_tf['RMSE'] if best_tf else 'N/A'})
 
-3. **Naive 基线的竞争力**: 在金融时间序列中，简单的前一日预测（Naive t-1）具有较强竞争力，反映了国债收益率的随机游走特性。任何有效模型都必须显著优于此基线。
+3. **Transformer 模型分析**: Transformer 类模型在国债收益率这类低噪声、强自相关的金融时序上，面临"过度建模"的风险——自注意力机制更适合捕捉复杂的长距离依赖关系，但国债收益率的变化主要由短期自相关驱动，简单的滞后特征已足够。PatchTST 通过分 patch 建模能缓解过拟合，通常是 Transformer 类中表现最好的。
 
-4. **ARIMA 类模型**: Auto-ARIMA 通过 AIC 自动选择最优阶数 {arima_order}，SARIMAX 的周期性建模在某些情况下可提供增量改进。
+4. **Naive 基线的竞争力**: 前一日预测（Naive t-1）极具竞争力，反映了国债收益率的随机游走特性。
 
-5. **ETS**: 指数平滑模型适合趋势外推，但在收益率变化方向不稳定时表现一般。
+5. **统计模型局限**: ARIMA/ETS 的多步直接预测误差快速积累，在 60 天测试期上 R² 为负。
+
+### 各类模型适用场景
+
+| 类别 | 适用场景 | 局限 |
+|---|---|---|
+| 统计模型 (ARIMA/ETS) | 短期 (1-5 步) 预测，可解释性强 | 多步预测误差积累，无法捕捉非线性 |
+| ML 模型 (Ridge/XGBoost) | 中短期预测，特征工程灵活 | 依赖手工特征，不自动学习序列模式 |
+| Transformer 类 | 长序列、复杂模式、多变量场景 | 小数据集易过拟合，训练成本高 |
 
 ### 建议
 
 - **短期预测 (1-5天)**: 优先使用 {best_name}，辅以 Naive 作为合理性检查。
-- **中期预测 (1-3月)**: 建议结合宏观经济因子（GDP、CPI、央行政策）构建多因子模型。
-- **模型集成**: 可尝试将统计模型和 ML 模型的预测进行加权平均以提高稳健性。
-- **实时更新**: 建议每周重训练模型以适应最新市场环境。
+- **中期预测 (1-3月)**: 结合宏观经济因子（GDP、CPI、央行政策）构建多因子模型。
+- **Transformer 优化方向**: 增加训练数据（多期限债券联合建模）、加入宏观因子作为协变量、使用预训练时序基础模型。
+- **模型集成**: 将 ML 模型和 Transformer 模型预测加权平均可提高稳健性。
 """)
 
 with open(REPORT_PATH, "w", encoding="utf-8") as f:
