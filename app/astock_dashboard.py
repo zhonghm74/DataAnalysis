@@ -22,6 +22,7 @@ from astock.market_data import fetch_stock, add_technical_indicators, STOCK_POOL
 from astock.stock_selector import SELECTORS, ML_SELECTORS
 from astock.signal_model import SIGNAL_MODELS, ML_SIGNAL_MODELS
 from astock.backtester import run_backtest, BacktestConfig
+from astock.stock_names import get_stock_name, format_stock
 from astock.ml_meta_labeling import MetaLabeler
 from astock.ml_factor_selector import MLFactorSelector
 from astock.ml_lstm_signal import LSTMSignalModel
@@ -120,13 +121,16 @@ if page == "📊 选股策略":
         if results:
             st.subheader(f"🏆 {selector_name} — 选股结果")
             res_df = pd.DataFrame(results, columns=["代码", "评分", "理由"])
+            res_df["名称"] = res_df["代码"].apply(get_stock_name)
+            res_df = res_df[["代码", "名称", "评分", "理由"]]
             res_df.index = range(1, len(res_df) + 1)
             res_df.index.name = "排名"
             st.dataframe(res_df, use_container_width=True)
 
             # Show charts for top picks
             for i, (sym, score, reason) in enumerate(results[:3]):
-                with st.expander(f"#{i+1} {sym} — 评分 {score} | {reason}", expanded=(i == 0)):
+                sym_name = get_stock_name(sym)
+                with st.expander(f"#{i+1} {sym} {sym_name} — 评分 {score} | {reason}", expanded=(i == 0)):
                     try:
                         df = fetch_stock(sym)
                         df = add_technical_indicators(df)
@@ -169,14 +173,16 @@ if page == "📊 选股策略":
 
         st.subheader("📋 股票池")
         for name, pool in STOCK_POOLS.items():
-            st.markdown(f"- **{name}**: {len(pool)} 只 — `{', '.join(pool[:5])}...`")
+            display_stocks = [format_stock(c) for c in pool[:5]]
+            st.markdown(f"- **{name}**: {len(pool)} 只 — {', '.join(display_stocks)}...")
 
 # ══════════════════════════════════════════════════════════════
 # PAGE 2: SIGNAL & BACKTEST
 # ══════════════════════════════════════════════════════════════
 elif page == "📈 交易信号 & 回测":
+    stock_display = format_stock(symbol)
     st.title("📈 A股交易信号与回测系统")
-    st.caption(f"股票: {symbol} | 信号: {signal_name} | T+1 / 涨跌停 / 交易费用")
+    st.caption(f"股票: {stock_display} | 信号: {signal_name} | T+1 / 涨跌停 / 交易费用")
 
     if "run_bt" in dir() and run_bt:
         with st.spinner(f"加载 {symbol} 数据并运行回测..."):
@@ -244,7 +250,7 @@ elif page == "📈 交易信号 & 回测":
             col1, col2, col3, col4 = st.columns(4)
             latest = df.iloc[-1]
             with col1:
-                st.metric("最新价", f"{latest['close']:.2f}",
+                st.metric(f"{stock_display}", f"{latest['close']:.2f}",
                            delta=f"{latest['pct_chg']:.2f}%")
             with col2:
                 st.metric("信号", "买入 🟢" if signals.iloc[-1] > 0 else
@@ -459,7 +465,7 @@ elif page == "📈 交易信号 & 回测":
                     var_95 = np.percentile(daily_ret, 5)
                     st.metric("VaR (95%)", f"{var_95:.4f}%")
 
-        st.success(f"✅ 回测完成 | {symbol} | {signal_name} | "
+        st.success(f"✅ 回测完成 | {stock_display} | {signal_name} | "
                    f"收益: {bt['总收益率(%)']:.2f}% | 胜率: {bt['胜率(%)']:.1f}%")
 
     else:
