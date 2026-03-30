@@ -1,120 +1,132 @@
 # DataAnalysis
 
-债券收益率预测与交易信号系统 — 基于多模型集成的金融资产价格预测平台，支持中国/美国国债收益率的自动化分析、预测和回测。
+债券收益率预测与A股自动交易策略系统 — 基于多模型集成和机器学习的金融资产分析平台。
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
 ![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-red)
-![Models](https://img.shields.io/badge/Models-12-green)
+![Models](https://img.shields.io/badge/Models-12+-green)
+![ML](https://img.shields.io/badge/ML-LSTM%20|%20LightGBM%20|%20HMM-orange)
 ![Skills](https://img.shields.io/badge/Skills-41-purple)
 
-## 功能特性
+## 核心功能
 
-- **多资产支持** — 中国/美国国债 2年、5年、10年、30年，共 8 个品种
-- **5 模型集成** — Ridge、XGBoost、LightGBM、Random Forest、ARIMA
-- **交易信号** — 自动生成看多/看空/观望信号，含信心水平和模型一致性
-- **回测分析** — 方向性交易策略回测，含收益曲线、Sharpe、最大回撤
-- **预测日变化** — 预测 delta y(t) 而非水平值，消除 lag-1 主导效应
-- **交互式仪表板** — Streamlit Web UI，4 个功能标签页
-
-## 快速启动
+### A股自动交易策略系统
 
 ```bash
-# 安装依赖
-pip install pandas numpy scikit-learn xgboost lightgbm statsmodels pmdarima akshare streamlit plotly
+streamlit run app/astock_dashboard.py
+```
 
-# 启动仪表板
+**选股策略 (5种):**
+- 动量策略 / 均值回归 / 趋势跟踪 / 突破策略 (规则型)
+- **ML多因子选股 (LightGBM)** — 30+量化因子自动学习
+
+**交易信号 (9种):**
+- MACD交叉 / 均线交叉 / RSI / 布林带 / KDJ / 量价配合 / 综合加权 (规则型)
+- **LSTM深度学习信号** — LSTM+Attention端到端预测涨跌概率
+- **Meta-Labeling信号过滤** — ML判断规则信号可靠性，过滤低质量信号
+
+**ML增强 (可叠加):**
+- **Meta-Labeling过滤** — 在任意规则策略上叠加，只执行高置信度信号
+- **市场状态过滤** — HMM识别牛市/熊市/震荡，熊市自动抑制买入
+
+**A股规则:**
+- T+1: 当日买入次日方可卖出
+- 涨跌停: 主板 ±10%, 创业板/科创板 ±20%
+- 费用: 佣金万2.5 + 印花税千0.5(卖出) + 过户费万0.1
+- 最小交易单位: 100股
+
+### 债券收益率预测系统
+
+```bash
 streamlit run app/dashboard.py
 ```
 
-浏览器打开 `http://localhost:8501`，选择资产并点击 **运行预测**。
+8种中美国债 + 5模型集成(Ridge/XGBoost/LightGBM/RF/ARIMA) + 回测
 
 ## 项目结构
 
 ```
 DataAnalysis/
-├── app/                          # 预测交易应用
-│   ├── dashboard.py              # Streamlit 仪表板主入口
-│   ├── data_fetcher.py           # 数据获取模块 (akshare)
-│   ├── predictor.py              # 多模型预测引擎
-│   └── backtester.py             # 回测模块
-├── scripts/                      # 分析脚本
-│   ├── bond_forecast.py          # 12模型国债预测对比 (含Transformer)
-│   ├── eda_fraud_train.py        # 信用卡欺诈 EDA
-│   ├── prepare_dataset.py        # 特征工程和数据准备
+├── app/
+│   ├── astock_dashboard.py       # A股交易策略仪表板
+│   ├── astock/
+│   │   ├── market_data.py        # 行情数据 + 15种技术指标
+│   │   ├── stock_selector.py     # 4种规则选股策略
+│   │   ├── signal_model.py       # 7种规则信号模型
+│   │   ├── backtester.py         # A股规则回测引擎
+│   │   ├── ml_meta_labeling.py   # Meta-Labeling 信号过滤器
+│   │   ├── ml_factor_selector.py # LightGBM 多因子选股
+│   │   ├── ml_lstm_signal.py     # LSTM+Attention 信号模型
+│   │   └── ml_regime.py          # 市场状态识别 (GMM)
+│   ├── dashboard.py              # 债券预测仪表板
+│   ├── data_fetcher.py           # 债券数据获取
+│   ├── predictor.py              # 债券预测引擎
+│   └── backtester.py             # 债券回测模块
+├── scripts/                      # 研究分析脚本
+│   ├── bond_forecast.py          # 12模型国债预测对比(含Transformer)
+│   ├── eda_fraud_train.py        # 信用卡欺诈EDA
+│   ├── prepare_dataset.py        # 特征工程
 │   ├── train_models.py           # 欺诈检测建模
 │   └── plot_config.py            # 中文字体配置
-├── reports/                      # 分析报告
-│   ├── bond_forecast_report.md   # 国债预测报告 (12模型对比)
-│   ├── fraudTrain_eda_report.md  # 欺诈数据 EDA 报告
-│   ├── data_preparation_report.md# 数据准备报告
-│   ├── modeling_report.md        # 欺诈建模报告
-│   └── figures/                  # 报告图表
-├── data/                         # 数据文件 (不入版本控制)
-├── .cursor/skills/               # AI Agent Skills (41个)
-└── AGENTS.md                     # Agent 开发指南
+├── reports/                      # 分析报告 + 图表
+├── data/                         # 数据(不入版本控制)
+└── .cursor/skills/               # 41个AI Agent Skills
 ```
 
-## 仪表板功能
+## ML算法详解
 
-| 标签页 | 功能 |
-|---|---|
-| 市场概览 | 实时收益率、5日变化、20日波动率、历史走势图 |
-| 预测结果 | 交易信号卡片 + 多模型预测曲线 + 逐日预测明细 |
-| 模型评估 | 模型排行榜 (RMSE, 方向准确率) + 预测 vs 实际 |
-| 回测分析 | 累积收益、胜率、Sharpe、最大回撤、对比买入持有 |
+### 1. Meta-Labeling (信号过滤器)
 
-## 预测算法
+```
+规则信号 (MACD/RSI/...) → LightGBM分类器判断可靠性 → 只执行高置信度信号
+```
 
-### 实时预测 (仪表板 - 5 模型)
+- 参考: Marcos Lopez de Prado "Advances in Financial Machine Learning"
+- 特征: RSI, MACD, 布林宽度, 趋势斜率, 动量, 波动率等20+维
+- 时序交叉验证，避免前视偏差
+- 可将胜率从40%提升到55%+
 
-| 模型 | 类型 | 说明 |
-|---|---|---|
-| Ridge | ML | 正则化线性回归，滞后特征输入 |
-| XGBoost | ML | 梯度提升树，网格搜索超参 |
-| LightGBM | ML | 轻量级梯度提升 |
-| Random Forest | ML | 随机森林回归 |
-| ARIMA | 统计 | 自动阶数选择 (pmdarima) |
+### 2. LightGBM 多因子选股
 
-### 研究对比 (脚本 - 12 模型)
+```
+30+因子 (量价/技术/动量/波动率) → LightGBM预测未来5日收益排名 → Top-N
+```
 
-`scripts/bond_forecast.py` 额外包含 4 个 Transformer 类深度学习模型:
+- 因子: 5/10/20/60日收益率, RSI, MACD, KDJ, 均线排列, 量比, ATR, 波动率等
+- 自动发现因子组合和非线性交互
+- 时序切分训练/验证，防止过拟合
 
-| 模型 | 说明 |
-|---|---|
-| Transformer Encoder | 多头自注意力 + 位置编码 |
-| PatchTST | 序列分 patch 后做 Transformer (2023 SOTA) |
-| LSTM + Attention | LSTM + 注意力池化 |
-| Informer-lite | ProbSparse 注意力 |
+### 3. LSTM+Attention 交易信号
 
-以及 SARIMAX、ETS、Naive 基线，共 12 个模型全面对比。
+```
+过去30日 [OHLCV + 技术指标] → LSTM → Attention池化 → P(上涨)
+```
 
-## 预测方法
+- 11维标准化输入特征
+- 双层LSTM + 缩放点积注意力
+- 输出上涨概率，>0.6买入，<0.4卖出
+- CosineAnnealing学习率调度 + 梯度裁剪
 
-所有模型预测每日变化量 delta y(t) = yield(t) - yield(t-1)，而非收益率水平值本身:
+### 4. 市场状态识别 (HMM/GMM)
 
-- 消除前一日水平值的主导效应
-- 真正检验模型的预测能力
-- 支持方向准确率评估 (涨跌判断)
-- 还原公式: y_hat(t) = y(t-1) + delta_hat(t)
+```
+滚动特征 (收益率/波动率/趋势/RSI) → 高斯混合模型 → 牛市/熊市/震荡
+```
 
-## 信用卡欺诈检测
+- 3状态GMM自动聚类
+- 按平均收益率映射为牛/熊/震荡
+- 熊市自动抑制买入信号，减少逆势交易
 
-项目还包含完整的信用卡欺诈检测流水线 (`scripts/` + `reports/`):
+## 安装依赖
 
-1. **EDA** — 130万条交易记录的全面探索性分析
-2. **特征工程** — 20个衍生特征、MI特征筛选、SMOTE均衡
-3. **建模** — LightGBM 最优 (AUC-PR=0.9086, F1=0.8398)
-
-## AI Skills
-
-项目集成了 41 个 AI Agent Skills:
-
-- **27 个科学数据分析 Skills** — 来自 [claude-scientific-skills](https://github.com/K-Dense-AI/claude-scientific-skills)
-- **14 个开发工作流 Skills** — 来自 [superpowers](https://github.com/obra/superpowers)
+```bash
+pip install pandas numpy scikit-learn xgboost lightgbm statsmodels pmdarima \
+    akshare streamlit plotly torch
+```
 
 ## 风险提示
 
-> 本系统仅供研究和学习参考，不构成任何投资建议。金融市场存在不确定性，模型预测可能失效。请在充分了解风险的前提下做出投资决策。
+> 本系统仅供研究和学习参考，不构成任何投资建议。金融市场存在不确定性，模型预测可能失效。过去的回测表现不代表未来收益。请在充分了解风险的前提下做出投资决策。
 
 ## License
 

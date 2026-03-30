@@ -19,9 +19,13 @@ from plotly.subplots import make_subplots
 from datetime import datetime
 
 from astock.market_data import fetch_stock, add_technical_indicators, STOCK_POOLS
-from astock.stock_selector import SELECTORS
-from astock.signal_model import SIGNAL_MODELS
+from astock.stock_selector import SELECTORS, ML_SELECTORS
+from astock.signal_model import SIGNAL_MODELS, ML_SIGNAL_MODELS
 from astock.backtester import run_backtest, BacktestConfig
+from astock.ml_meta_labeling import MetaLabeler
+from astock.ml_factor_selector import MLFactorSelector
+from astock.ml_lstm_signal import LSTMSignalModel
+from astock.ml_regime import MarketRegimeDetector
 
 st.set_page_config(page_title="A股自动交易策略系统", page_icon="🇨🇳", layout="wide")
 
@@ -47,14 +51,23 @@ with st.sidebar:
     st.markdown("---")
     if page == "📊 选股策略":
         pool_name = st.selectbox("股票池", list(STOCK_POOLS.keys()))
-        selector_name = st.selectbox("选股策略", list(SELECTORS.keys()))
+        all_selectors = list(SELECTORS.keys()) + ML_SELECTORS
+        selector_name = st.selectbox("选股策略", all_selectors)
         top_n = st.slider("选股数量", 3, 10, 5)
         run_select = st.button("🔍 运行选股", type="primary", use_container_width=True)
     else:
         st.subheader("标的设置")
         symbol = st.text_input("股票代码", value="600519")
         start_date = st.date_input("起始日期", value=pd.to_datetime("2023-01-01"))
-        signal_name = st.selectbox("信号模型", list(SIGNAL_MODELS.keys()))
+        all_signals = list(SIGNAL_MODELS.keys()) + ML_SIGNAL_MODELS
+        signal_name = st.selectbox("信号模型", all_signals)
+
+        st.markdown("---")
+        st.subheader("🤖 ML增强")
+        use_meta_label = st.checkbox("启用 Meta-Labeling 过滤", value=False,
+                                      help="用ML判断规则信号是否可靠，过滤低质量信号")
+        use_regime = st.checkbox("启用市场状态过滤", value=False,
+                                  help="识别牛市/熊市/震荡，熊市抑制买入信号")
 
         st.markdown("---")
         st.subheader("回测参数")
@@ -81,10 +94,28 @@ if page == "📊 选股策略":
 
     if "run_select" in dir() and run_select:
         pool = STOCK_POOLS[pool_name]
-        selector = SELECTORS[selector_name]
 
-        with st.spinner(f"正在运行 {selector_name}，分析 {len(pool)} 只股票..."):
-            results = selector(pool, top_n=top_n)
+        if selector_name in SELECTORS:
+            selector = SELECTORS[selector_name]
+            with st.spinner(f"正在运行 {selector_name}，分析 {len(pool)} 只股票..."):
+                results = selector(pool, top_n=top_n)
+        elif selector_name == "ML多因子选股 (LightGBM)":
+            ml_selector = MLFactorSelector(predict_days=5)
+            progress_bar = st.progress(0, text="训练ML多因子模型...")
+            ml_selector.train(pool, progress_callback=lambda p: progress_bar.progress(p, text=f"训练中... {p:.0%}"))
+            progress_bar.empty()
+            results = ml_selector.select(pool, top_n=top_n)
+            if ml_selector.metrics:
+                st.info(f"ML模型训练完成 — {' | '.join(f'{k}: {v}' for k, v in ml_selector.metrics.items())}")
+                imp = ml_selector.get_feature_importance()
+                if len(imp) > 0:
+                    with st.expander("📊 ML因子重要性"):
+                        fig = go.Figure(go.Bar(y=imp["feature"].head(15), x=imp["importance"].head(15),
+                                                orientation="h", marker_color="teal"))
+                        fig.update_layout(height=350, title="Top-15 因子重要性", margin=dict(l=0,r=0,t=30,b=0))
+                        st.plotly_chart(fig, use_container_width=True)
+        else:
+            results = []
 
         if results:
             st.subheader(f"🏆 {selector_name} — 选股结果")
@@ -156,8 +187,47 @@ elif page == "📈 交易信号 & 回测":
                 st.error(f"获取数据失败: {e}")
                 st.stop()
 
-            signal_func = SIGNAL_MODELS[signal_name]
-            signals = signal_func(df)
+            # Generate signals
+            ml_info = {}
+            if signal_name == "LSTM 深度学习信号":
+                lstm_model = LSTMSignalModel(seq_len=30, epochs=50)
+                lstm_model.fit(df)
+                signals = lstm_model.predict_signals(df)
+                ml_info["LSTM模型"] = lstm_model.metrics
+                ml_info["_lstm_proba"] = lstm_model.predict_proba_series(df)
+            elif signal_name == "Meta-Labeling 信号过滤":
+                from astock.signal_model import composite_signal
+                raw_signals = composite_signal(df)
+                meta = MetaLabeler(hold_days=5, confidence_threshold=0.55)
+                meta.fit(df, raw_signals)
+                signals = meta.filter_signals(df, raw_signals)
+                ml_info["Meta-Labeling"] = meta.metrics
+                ml_info["_meta_imp"] = meta.get_feature_importance()
+                ml_info["原始信号数"] = int((raw_signals != 0).sum())
+                ml_info["过滤后信号数"] = int((signals != 0).sum())
+            else:
+                signal_func = SIGNAL_MODELS[signal_name]
+                signals = signal_func(df)
+
+            # Apply Meta-Labeling filter (on top of rule-based signals)
+            if use_meta_label and signal_name not in ML_SIGNAL_MODELS:
+                meta = MetaLabeler(hold_days=5, confidence_threshold=0.55)
+                meta.fit(df, signals)
+                raw_count = int((signals != 0).sum())
+                signals = meta.filter_signals(df, signals)
+                ml_info["Meta-Labeling过滤"] = meta.metrics
+                ml_info["过滤前信号"] = raw_count
+                ml_info["过滤后信号"] = int((signals != 0).sum())
+
+            # Apply regime filter
+            regime_info = None
+            if use_regime:
+                regime_det = MarketRegimeDetector()
+                regime_det.fit(df)
+                regimes = regime_det.detect(df)
+                signals = regime_det.filter_signals_by_regime(signals, regimes)
+                regime_info = regime_det.detect_current(df)
+                ml_info["市场状态"] = regime_info
 
             bt_config = BacktestConfig(
                 initial_capital=initial_capital,
@@ -192,6 +262,46 @@ elif page == "📈 交易信号 & 回测":
                 st.markdown('<div class="signal-sell"><h2>卖出信号 🔴</h2></div>', unsafe_allow_html=True)
             else:
                 st.markdown('<div class="signal-hold"><h2>观望 ⚪</h2></div>', unsafe_allow_html=True)
+
+            # ML info display
+            if ml_info:
+                with st.expander("🤖 ML 模型详情", expanded=False):
+                    for key, val in ml_info.items():
+                        if key.startswith("_"):
+                            continue
+                        if isinstance(val, dict):
+                            st.markdown(f"**{key}**")
+                            st.json(val)
+                        else:
+                            st.markdown(f"**{key}**: {val}")
+
+                    # LSTM probability chart
+                    if "_lstm_proba" in ml_info:
+                        proba = ml_info["_lstm_proba"]
+                        fig_p = go.Figure()
+                        fig_p.add_trace(go.Scatter(x=df.tail(120)["date"],
+                            y=proba.tail(120), mode="lines", name="P(上涨)",
+                            line=dict(color="#E91E63")))
+                        fig_p.add_hline(y=0.6, line_dash="dot", line_color="green")
+                        fig_p.add_hline(y=0.4, line_dash="dot", line_color="red")
+                        fig_p.update_layout(title="LSTM 上涨概率", height=250)
+                        st.plotly_chart(fig_p, use_container_width=True)
+
+                    # Meta-labeling feature importance
+                    if "_meta_imp" in ml_info:
+                        imp = ml_info["_meta_imp"]
+                        if len(imp) > 0:
+                            fig_i = go.Figure(go.Bar(y=imp["feature"].head(10),
+                                x=imp["importance"].head(10), orientation="h", marker_color="teal"))
+                            fig_i.update_layout(title="Meta-Labeling 特征重要性", height=300)
+                            st.plotly_chart(fig_i, use_container_width=True)
+
+            # Regime display
+            if regime_info:
+                rc = regime_info["颜色"]
+                st.markdown(f'<div style="background:{rc};color:white;padding:10px;border-radius:8px;text-align:center;">'
+                            f'<b>市场状态: {regime_info["当前状态"]}</b> — {regime_info["建议"]}</div>',
+                            unsafe_allow_html=True)
 
             # K-line chart with signals
             df_plot = df.tail(min(250, len(df))).copy()

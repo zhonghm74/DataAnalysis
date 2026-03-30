@@ -99,3 +99,6 @@ SIGNAL_MODELS = {
     "量价配合": volume_price_signal,
     "综合信号 (加权)": composite_signal,
 }
+
+# ML-enhanced signal models (require training)
+ML_SIGNAL_MODELS = ["LSTM 深度学习信号", "Meta-Labeling 信号过滤"]

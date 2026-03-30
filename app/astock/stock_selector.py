@@ -164,3 +164,5 @@ SELECTORS = {
     "趋势跟踪": trend_following_selector,
     "突破策略": breakout_selector,
 }
+
+ML_SELECTORS = ["ML多因子选股 (LightGBM)"]
